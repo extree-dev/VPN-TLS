@@ -32,17 +32,25 @@ type Device struct {
 
 // Open создаёт (или открывает) TUN-интерфейс с указанным именем.
 func Open(name string) (*Device, error) {
-	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	// Открываем «сырой» дескриптор и регистрируем его в poller Go только после
+	// TUNSETIFF: до привязки к интерфейсу epoll на /dev/net/tun не работает,
+	// и новые версии Go помечают файл как «not pollable».
+	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
 	}
 	var req ifReq
 	copy(req.Name[:], name)
 	req.Flags = iffTun | iffNoPi
-	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), tunSetIff, uintptr(unsafe.Pointer(&req))); e != 0 {
-		f.Close()
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tunSetIff, uintptr(unsafe.Pointer(&req))); e != 0 {
+		syscall.Close(fd)
 		return nil, fmt.Errorf("ioctl TUNSETIFF: %w", e)
 	}
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("set nonblock: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "/dev/net/tun")
 	return &Device{File: f, Name: strings.TrimRight(string(req.Name[:]), "\x00")}, nil
 }
 
