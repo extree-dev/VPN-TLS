@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; --ok: #1f9d55; --muted: #8a8f98; --err: #d93025; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; padding: 28px 24px; user-select: none; }
+  h1 { font-size: 22px; margin: 0 0 20px; }
+  .hidden { display: none !important; }
+  .hint { color: var(--muted); font-size: 13px; line-height: 1.4; margin-bottom: 10px; }
+  textarea { width: 100%; height: 150px; font: 12px Consolas, monospace; padding: 8px; border-radius: 8px;
+             border: 1px solid #8884; resize: none; user-select: text; }
+  .row { display: flex; justify-content: flex-end; margin-top: 12px; }
+  button.primary { background: #2563eb; color: #fff; border: 0; border-radius: 8px; padding: 9px 18px; font-size: 14px; cursor: pointer; }
+  button.primary:disabled { opacity: .5; cursor: default; }
+  #main { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  #power { width: 170px; height: 170px; border-radius: 50%; border: 0; background: #8883; cursor: pointer;
+           display: flex; align-items: center; justify-content: center; transition: background .2s; margin-top: 16px; }
+  #power svg { width: 64px; height: 64px; stroke: #fff; }
+  #power.on { background: var(--ok); }
+  #power.busy { background: #d6a100; }
+  #status { font-size: 20px; font-weight: 600; }
+  #name { font-weight: 600; }
+  #server { color: var(--muted); font-size: 13px; }
+  #error { color: var(--err); font-size: 13px; text-align: center; min-height: 18px; max-width: 360px; }
+  a.link { color: var(--err); font-size: 13px; cursor: pointer; margin-top: 30px; text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>VPN-TLS</h1>
+
+<div id="setup" class="hidden">
+  <div class="hint">Вставьте строку подключения <b>vpntls://</b> (Ctrl+V). Её выдаёт команда
+    «vpn-server client add» на сервере.</div>
+  <textarea id="link" spellcheck="false" placeholder="vpntls://…"></textarea>
+  <div class="row"><button id="save" class="primary">Сохранить</button></div>
+</div>
+
+<div id="main" class="hidden">
+  <button id="power" title="Подключить / отключить">
+    <svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round">
+      <path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/>
+    </svg>
+  </button>
+  <div id="status"></div>
+  <div id="name"></div>
+  <div id="server"></div>
+  <a class="link" id="remove">Удалить профиль</a>
+</div>
+
+<div id="error"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const names = { off: "Отключено", connecting: "Подключение…", connected: "Подключено", reconnecting: "Переподключение…" };
+let localError = "";
+
+async function refresh() {
+  let s;
+  try { s = await window.vpnState(); } catch (e) { return; }
+  $("setup").classList.toggle("hidden", s.hasProfile);
+  $("main").classList.toggle("hidden", !s.hasProfile);
+  $("status").textContent = names[s.status] || s.status;
+  $("name").textContent = s.name || "";
+  $("server").textContent = s.server || "";
+  const p = $("power");
+  p.classList.toggle("on", s.status === "connected");
+  p.classList.toggle("busy", s.status === "connecting" || s.status === "reconnecting");
+  $("error").textContent = localError || s.error || "";
+}
+
+$("save").onclick = async () => {
+  localError = "";
+  try { await window.vpnSave($("link").value.trim()); $("link").value = ""; }
+  catch (e) { localError = String(e.message || e); }
+  refresh();
+};
+$("power").onclick = async () => { localError = ""; await window.vpnToggle(); refresh(); };
+$("remove").onclick = async () => {
+  if (confirm("Удалить профиль? Понадобится снова вставить строку подключения.")) { await window.vpnRemove(); refresh(); }
+};
+document.addEventListener("contextmenu", e => { if (e.target.id !== "link") e.preventDefault(); });
+
+refresh();
+setInterval(refresh, 700);
+</script>
+</body>
+</html>

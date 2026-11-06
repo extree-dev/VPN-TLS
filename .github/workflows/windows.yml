@@ -1,0 +1,51 @@
+name: Windows
+
+on:
+  push:
+    paths: ['cmd/vpntls-windows/**', 'mobile/**', 'internal/**', 'go.mod', 'go.sum', '.github/workflows/windows.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Сборка vpntls.exe
+        run: |
+          GOOS=windows GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
+            go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/VPN-TLS.exe ./cmd/vpntls-windows
+
+      - name: Драйвер Wintun (wintun.net)
+        run: |
+          curl -fsSL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+          sha256sum wintun.zip
+          unzip -q wintun.zip
+          cp wintun/bin/${{ matrix.arch }}/wintun.dll dist/
+          cp wintun/LICENSE.txt dist/wintun-LICENSE.txt
+
+      - name: Инструкция
+        run: |
+          cat > dist/README.txt <<'TXT'
+          VPN-TLS для Windows
+
+          1. Распакуйте папку целиком (VPN-TLS.exe и wintun.dll должны лежать рядом).
+          2. Запустите VPN-TLS.exe и разрешите запуск от администратора.
+          3. Вставьте строку подключения vpntls:// и нажмите «Сохранить».
+          4. Нажмите на круглую кнопку — подключение.
+
+          Нужен Microsoft Edge WebView2 (есть в Windows 11; для Windows 10 —
+          https://go.microsoft.com/fwlink/p/?LinkId=2124703).
+          TXT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VPN-TLS-windows-${{ matrix.arch }}
+          path: dist/
