@@ -1,5 +1,5 @@
-// Package frame — простое кадрирование пакетов в потоке: [2 байта длины][данные].
-// На следующих этапах сюда добавятся шифрование и padding.
+// Package frame — кадрирование пакетов в потоке: [2 байта длины][данные].
+// Шифрование — в пакете noise, маскировка под HTTPS — на следующем этапе.
 package frame
 
 import (
@@ -38,8 +38,14 @@ func Read(r io.Reader, buf []byte) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// Pipe гоняет пакеты между TUN и потоком в обе стороны, пока одна из сторон не закроется.
-func Pipe(tun io.ReadWriter, conn io.ReadWriter) error {
+// PacketConn — источник и приёмник целых пакетов (например, шифрованная сессия).
+type PacketConn interface {
+	ReadPacket(buf []byte) ([]byte, error)
+	WritePacket(p []byte) error
+}
+
+// Pipe гоняет пакеты между TUN и PacketConn в обе стороны, пока одна из сторон не закроется.
+func Pipe(tun io.ReadWriter, conn PacketConn) error {
 	errc := make(chan error, 2)
 	go func() { // TUN -> сеть
 		buf := make([]byte, MaxSize)
@@ -49,7 +55,7 @@ func Pipe(tun io.ReadWriter, conn io.ReadWriter) error {
 				errc <- err
 				return
 			}
-			if err := Write(conn, buf[:n]); err != nil {
+			if err := conn.WritePacket(buf[:n]); err != nil {
 				errc <- err
 				return
 			}
@@ -58,7 +64,7 @@ func Pipe(tun io.ReadWriter, conn io.ReadWriter) error {
 	go func() { // сеть -> TUN
 		buf := make([]byte, MaxSize)
 		for {
-			p, err := Read(conn, buf)
+			p, err := conn.ReadPacket(buf)
 			if err != nil {
 				errc <- err
 				return
