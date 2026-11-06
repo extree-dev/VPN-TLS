@@ -56,14 +56,43 @@ func main() {
 	w.Run()
 }
 
+// dataDir — папка для профиля, журнала и данных WebView2.
+//
+// Программа всегда работает с правами администратора, а на рабочих
+// компьютерах это часто другая учётная запись (например, отдельный админ):
+// её профиль может быть недоступен для записи. Поэтому сначала пробуем
+// %ProgramData% (туда всегда могут писать администраторы), затем профиль
+// пользователя, затем папку рядом с программой.
 func dataDir() string {
-	base, err := os.UserCacheDir() // %LOCALAPPDATA%
-	if err != nil {
-		base = os.TempDir()
+	var candidates []string
+	if pd := os.Getenv("ProgramData"); pd != "" {
+		candidates = append(candidates, filepath.Join(pd, "VPN-TLS"))
 	}
-	dir := filepath.Join(base, "VPN-TLS")
-	os.MkdirAll(dir, 0o700)
-	return dir
+	if la, err := os.UserCacheDir(); err == nil {
+		candidates = append(candidates, filepath.Join(la, "VPN-TLS"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "data"))
+	}
+	for _, dir := range candidates {
+		if writable(dir) {
+			return dir
+		}
+	}
+	return os.TempDir()
+}
+
+func writable(dir string) bool {
+	if err := os.MkdirAll(filepath.Join(dir, "webview"), 0o700); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(dir, "check-*")
+	if err != nil {
+		return false
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return true
 }
 
 func relaunchAsAdmin() {
