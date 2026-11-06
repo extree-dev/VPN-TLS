@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/noise"
@@ -26,10 +27,23 @@ type Router struct {
 }
 
 type peer struct {
-	key  string
-	ip   netip.Addr
-	out  chan []byte
-	conn net.Conn
+	key, name, remote string
+	ip                netip.Addr
+	since             time.Time
+	out               chan []byte
+	conn              net.Conn
+	rx, tx            atomic.Uint64 // байты от клиента и к клиенту
+}
+
+// PeerInfo — состояние подключённого клиента (для статуса).
+type PeerInfo struct {
+	Name   string    `json:"name"`
+	Key    string    `json:"key"`
+	IP     string    `json:"ip"`
+	Remote string    `json:"remote"`
+	Since  time.Time `json:"since"`
+	RX     uint64    `json:"rx"`
+	TX     uint64    `json:"tx"`
 }
 
 // NewRouter. addr — адрес сервера с маской, например 10.8.0.1/24.
@@ -82,8 +96,8 @@ func (r *Router) usable(ip netip.Addr) bool {
 
 // Serve обслуживает сессию клиента с адресом ip, пока она жива.
 // Прежняя сессия с тем же адресом закрывается.
-func (r *Router) Serve(key string, ip netip.Addr, sess *noise.Session, conn net.Conn, keepalive time.Duration) error {
-	p := &peer{key: key, ip: ip, out: make(chan []byte, 512), conn: conn}
+func (r *Router) Serve(key, name, remote string, ip netip.Addr, sess *noise.Session, conn net.Conn, keepalive time.Duration) error {
+	p := &peer{key: key, name: name, remote: remote, ip: ip, since: time.Now(), out: make(chan []byte, 512), conn: conn}
 	r.mu.Lock()
 	if old := r.peers[ip]; old != nil {
 		old.conn.Close()
@@ -99,6 +113,7 @@ func (r *Router) Serve(key string, ip netip.Addr, sess *noise.Session, conn net.
 		if r.isolate && r.prefix.Contains(dst) && dst != r.gw {
 			return nil // клиенты не видят друг друга
 		}
+		p.rx.Add(uint64(len(pkt)))
 		_, err := r.tun.Write(pkt)
 		return err
 	}, keepalive)
@@ -117,7 +132,7 @@ func (r *Router) Kick(keep func(key string) bool) {
 	defer r.mu.Unlock()
 	for _, p := range r.peers {
 		if !keep(p.key) {
-			log.Printf("клиент %s… (%s) больше не разрешён — отключаю", p.key[:8], p.ip)
+			log.Printf("клиент %s (%s) больше не разрешён — отключаю", p.name, p.ip)
 			p.conn.Close()
 		}
 	}
@@ -146,7 +161,20 @@ func (r *Router) Run() error {
 		}
 		select {
 		case p.out <- append([]byte(nil), buf[:n]...):
+			p.tx.Add(uint64(n))
 		default: // клиент не успевает — пакет теряется
 		}
 	}
+}
+
+// Snapshot — список подключённых клиентов.
+func (r *Router) Snapshot() []PeerInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]PeerInfo, 0, len(r.peers))
+	for _, p := range r.peers {
+		out = append(out, PeerInfo{Name: p.name, Key: p.key, IP: p.ip.String(), Remote: p.remote,
+			Since: p.since, RX: p.rx.Load(), TX: p.tx.Load()})
+	}
+	return out
 }

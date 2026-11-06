@@ -9,6 +9,7 @@
 //	vpn-server client add <имя>     — создать клиента, показать строку подключения и QR
 //	vpn-server client list          — список клиентов
 //	vpn-server client remove <имя>  — удалить клиента (его сессия сразу закроется)
+//	vpn-server status               — кто подключён и сколько трафика
 //
 // Любой флаг можно задать переменной окружения VPN_<ИМЯ>, например VPN_PATH.
 package main
@@ -32,6 +33,7 @@ import (
 
 	"github.com/extree-dev/vpn-tls/internal/clients"
 	"github.com/extree-dev/vpn-tls/internal/config"
+	"github.com/extree-dev/vpn-tls/internal/guard"
 	"github.com/extree-dev/vpn-tls/internal/keys"
 	"github.com/extree-dev/vpn-tls/internal/noise"
 	"github.com/extree-dev/vpn-tls/internal/route"
@@ -42,9 +44,11 @@ import (
 
 type options struct {
 	listen, plain, path, addr, keyFile, allow, clientsFile string
+	replayFile, statusFile                                 string
 	certFile, certKey, domain, fallback, dns, public, pin  string
 	mtu                                                    int
-	keepalive                                              time.Duration
+	keepalive, maxSkew                                     time.Duration
+	rateBurst                                              int
 	nat, isolate                                           bool
 }
 
@@ -67,17 +71,25 @@ func main() {
 	str(&o.dns, "dns", "1.1.1.1,1.0.0.1", "DNS-серверы для клиентов через запятую")
 	str(&o.public, "public", "", "внешний адрес host:port для строк подключения (по умолчанию <domain>:$VPN_PUBLIC_PORT или :443)")
 	str(&o.pin, "pin", "auto", "отпечаток в строках подключения: auto — из -cert, off — без pin (настоящий сертификат)")
+	str(&o.replayFile, "replay", "replay.json", "файл защиты от повтора рукопожатий")
+	str(&o.statusFile, "status", "status.json", "файл статуса для команды status")
 	fs.IntVar(&o.mtu, "mtu", envInt("mtu", 1400), "MTU туннеля")
+	fs.IntVar(&o.rateBurst, "rate", envInt("rate", 10), "попыток подключения с одного IP за минуту (0 — без ограничения)")
+	fs.DurationVar(&o.maxSkew, "max-skew", envDur("max-skew", 5*time.Minute), "допустимое расхождение часов клиента и сервера")
 	fs.DurationVar(&o.keepalive, "keepalive", envDur("keepalive", 15*time.Second), "интервал keepalive")
 	fs.BoolVar(&o.nat, "nat", envBool("nat", false), "выпускать клиентов в интернет (MASQUERADE)")
 	fs.BoolVar(&o.isolate, "isolate", envBool("isolate", true), "запретить клиентам видеть друг друга")
 
 	fs.Parse(os.Args[1:])
 	if rest := fs.Args(); len(rest) > 0 {
-		if rest[0] != "client" {
-			log.Fatalf("неизвестная команда %q", rest[0])
+		switch rest[0] {
+		case "client":
+			clientCmd(o, rest[1:])
+		case "status":
+			statusCmd(o)
+		default:
+			log.Fatalf("неизвестная команда %q (есть: client, status)", rest[0])
 		}
-		clientCmd(o, rest[1:])
 		return
 	}
 	serve(o)
@@ -178,10 +190,24 @@ func serve(o *options) {
 		return e, ip, err
 	}
 
+	replay := &guard.Replay{File: o.replayFile, MaxSkew: o.maxSkew}
+	if err := replay.Load(); err != nil {
+		log.Printf("%s: %v (начинаю с пустого)", o.replayFile, err)
+	}
+	var limit *guard.Limiter
+	if o.rateBurst > 0 {
+		limit = &guard.Limiter{Burst: o.rateBurst, Every: time.Minute / time.Duration(o.rateBurst)}
+	}
+	go writeStatus(o.statusFile, router)
+
 	h := &transport.Handler{
-		Priv:     priv,
-		Path:     o.path,
-		Fallback: transport.StubSite,
+		Priv:       priv,
+		Path:       o.path,
+		Fallback:   transport.StubSite,
+		Replay:     replay,
+		Limit:      limit,
+		TrustProxy: o.plain != "",
+		Logf:       log.Printf,
 		Allowed: func(pub []byte) bool {
 			_, ok := store.Lookup(pub)
 			return ok
@@ -201,7 +227,7 @@ func serve(o *options) {
 			}
 			return cfg.Marshal(), nil
 		},
-		OnSession: func(sess *noise.Session, conn net.Conn, pub *ecdh.PublicKey) {
+		OnSession: func(sess *noise.Session, conn net.Conn, pub *ecdh.PublicKey, remote string) {
 			e, ip, err := lease(pub)
 			if err != nil {
 				return
@@ -210,8 +236,8 @@ func serve(o *options) {
 			if name == "" {
 				name = e.Key[:8] + "…"
 			}
-			log.Printf("подключён %s (%s), адрес %s; всего онлайн: %d", name, remote(conn), ip, router.Count()+1)
-			err = router.Serve(e.Key, ip, sess, conn, o.keepalive)
+			log.Printf("подключён %s с %s, адрес %s; всего онлайн: %d", name, remote, ip, router.Count()+1)
+			err = router.Serve(e.Key, name, remote, ip, sess, conn, o.keepalive)
 			log.Printf("отключён %s (%s): %v", name, ip, err)
 		},
 	}
@@ -242,9 +268,6 @@ func serve(o *options) {
 	log.Printf("слушаю %s (HTTPS), путь %q", o.listen, o.path)
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
-
-// remote — адрес соединения (за прокси это адрес прокси).
-func remote(c net.Conn) string { return c.RemoteAddr().String() }
 
 func loadKey(path string) *ecdh.PrivateKey {
 	priv, created, err := keys.LoadOrCreate(path)

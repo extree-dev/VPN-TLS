@@ -21,10 +21,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/frame"
+	"github.com/extree-dev/vpn-tls/internal/guard"
 	"github.com/extree-dev/vpn-tls/internal/noise"
 )
 
@@ -41,11 +41,13 @@ type Handler struct {
 	// во втором сообщении рукопожатия. Ошибка — отказ в подключении.
 	Payload func(client *ecdh.PublicKey) ([]byte, error)
 	// OnSession вызывается для каждого авторизованного клиента и должна
-	// блокироваться, пока сессия жива.
-	OnSession func(sess *noise.Session, conn net.Conn, client *ecdh.PublicKey)
+	// блокироваться, пока сессия жива. remote — реальный IP клиента.
+	OnSession func(sess *noise.Session, conn net.Conn, client *ecdh.PublicKey, remote string)
 
-	mu     sync.Mutex
-	lastTS map[string]uint64
+	Replay     *guard.Replay  // защита от повтора рукопожатия
+	Limit      *guard.Limiter // ограничение попыток с одного IP (nil — без ограничения)
+	TrustProxy bool           // брать IP клиента из X-Forwarded-For (сервер за Caddy)
+	Logf       func(format string, args ...any)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +55,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Fallback.ServeHTTP(w, r)
 		return
 	}
-	req, ok := h.authenticate(r)
+	remote := h.clientIP(r)
+	if h.Limit != nil && !h.Limit.Allow(remote, time.Now()) {
+		h.Fallback.ServeHTTP(w, r) // слишком часто — снаружи выглядит как обычный ответ сайта
+		return
+	}
+	req, ok := h.authenticate(r, remote)
 	if !ok {
 		h.Fallback.ServeHTTP(w, r)
 		return
@@ -98,7 +105,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	h.OnSession(sess, conn, req.ClientPub)
+	h.OnSession(sess, conn, req.ClientPub, remote)
 }
 
 func isUpgrade(r *http.Request) bool {
@@ -112,7 +119,7 @@ func wsAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func (h *Handler) authenticate(r *http.Request) (*noise.Request, bool) {
+func (h *Handler) authenticate(r *http.Request, remote string) (*noise.Request, bool) {
 	c, err := r.Cookie(CookieName)
 	if err != nil {
 		return nil, false
@@ -125,20 +132,42 @@ func (h *Handler) authenticate(r *http.Request) (*noise.Request, bool) {
 	if err != nil {
 		return nil, false
 	}
-	id := string(req.ClientPub.Bytes())
 	if !h.Allowed(req.ClientPub.Bytes()) {
 		return nil, false
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.lastTS == nil {
-		h.lastTS = map[string]uint64{}
+	if err := h.Replay.Check(base64.StdEncoding.EncodeToString(req.ClientPub.Bytes()), req.Timestamp, time.Now()); err != nil {
+		h.logf("%s (%s…): отклонён: %v", remote, keyPrefix(req.ClientPub), err)
+		return nil, false
 	}
-	if req.Timestamp <= h.lastTS[id] {
-		return nil, false // повтор старого рукопожатия
-	}
-	h.lastTS[id] = req.Timestamp
 	return req, true
+}
+
+// clientIP — реальный адрес клиента. За обратным прокси он в последнем
+// элементе X-Forwarded-For (его дописывает сам прокси).
+func (h *Handler) clientIP(r *http.Request) string {
+	if h.TrustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
+				return ip
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func (h *Handler) logf(format string, args ...any) {
+	if h.Logf != nil {
+		h.Logf(format, args...)
+	}
+}
+
+func keyPrefix(p *ecdh.PublicKey) string {
+	return base64.StdEncoding.EncodeToString(p.Bytes())[:8]
 }
 
 // lengthPrefixed добавляет 2 байта длины, чтобы получатель отделил сообщение от padding.
