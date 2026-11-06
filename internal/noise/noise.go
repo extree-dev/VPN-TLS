@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	mrand "math/rand/v2"
 )
 
 const (
@@ -294,6 +295,9 @@ type Keys struct{ Send, Recv [32]byte }
 
 // Session шифрует пакеты поверх потока. ReadPacket и WritePacket можно
 // вызывать параллельно друг с другом, но каждый — только из одной горутины.
+//
+// Открытый текст кадра: [2 байта длины пакета][пакет][случайный padding],
+// чтобы длины зашифрованных кадров не повторяли длины IP-пакетов.
 type Session struct {
 	w, r   cipher.AEAD
 	wn, rn uint64
@@ -301,7 +305,12 @@ type Session struct {
 	write  func(io.Writer, []byte) error
 	read   func(io.Reader, []byte) ([]byte, error)
 	rbuf   []byte
+	pbuf   []byte
+	wbuf   []byte
 }
+
+// MaxPadding — верхняя граница случайного padding на пакет.
+const MaxPadding = 128
 
 // NewSession создаёт сессию. write/read — функции кадрирования (см. пакет frame).
 func NewSession(k *Keys, rw io.ReadWriter,
@@ -315,7 +324,8 @@ func NewSession(k *Keys, rw io.ReadWriter,
 	if err != nil {
 		return nil, err
 	}
-	return &Session{w: w, r: r, rw: rw, write: write, read: read, rbuf: make([]byte, 65535)}, nil
+	return &Session{w: w, r: r, rw: rw, write: write, read: read,
+		rbuf: make([]byte, 65535), pbuf: make([]byte, 65535), wbuf: make([]byte, 0, 65535)}, nil
 }
 
 // WritePacket шифрует и отправляет один пакет.
@@ -323,7 +333,18 @@ func (s *Session) WritePacket(p []byte) error {
 	if s.wn == math.MaxUint64 {
 		return ErrNonce
 	}
-	ct := s.w.Seal(nil, nonce(s.wn), p, nil)
+	pad := mrand.IntN(MaxPadding)
+	if 2+len(p)+pad+tagSize > 65535 {
+		pad = 0
+		if 2+len(p)+tagSize > 65535 {
+			return errors.New("noise: packet too large")
+		}
+	}
+	pt := s.wbuf[:2+len(p)+pad]
+	binary.BigEndian.PutUint16(pt, uint16(len(p)))
+	copy(pt[2:], p)
+	clear(pt[2+len(p):])
+	ct := s.w.Seal(nil, nonce(s.wn), pt, nil)
 	s.wn++
 	return s.write(s.rw, ct)
 }
@@ -337,10 +358,14 @@ func (s *Session) ReadPacket(buf []byte) ([]byte, error) {
 	if s.rn == math.MaxUint64 {
 		return nil, ErrNonce
 	}
-	pt, err := s.r.Open(buf[:0], nonce(s.rn), ct, nil)
-	if err != nil {
+	pt, err := s.r.Open(s.pbuf[:0], nonce(s.rn), ct, nil)
+	if err != nil || len(pt) < 2 {
 		return nil, errors.New("noise: decrypt failed")
 	}
 	s.rn++
-	return pt, nil
+	n := int(binary.BigEndian.Uint16(pt))
+	if 2+n > len(pt) || n > len(buf) {
+		return nil, errors.New("noise: bad packet length")
+	}
+	return buf[:copy(buf, pt[2:2+n])], nil
 }

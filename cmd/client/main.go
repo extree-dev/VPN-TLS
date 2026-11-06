@@ -1,21 +1,21 @@
-// Консольный клиент этапа 1.2 (Linux): шифрованный туннель до сервера (Noise IK).
+// Консольный клиент этапа 1.3 (Linux): туннель внутри HTTPS с отпечатком Chrome.
 package main
 
 import (
 	"flag"
 	"log"
-	"net"
-	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/frame"
 	"github.com/extree-dev/vpn-tls/internal/keys"
-	"github.com/extree-dev/vpn-tls/internal/noise"
+	"github.com/extree-dev/vpn-tls/internal/transport"
 	"github.com/extree-dev/vpn-tls/internal/tun"
 )
 
 func main() {
-	server := flag.String("server", "", "адрес сервера, например 1.2.3.4:8443")
+	server := flag.String("server", "", "адрес сервера, например 1.2.3.4:443")
 	serverPub := flag.String("server-pub", "", "публичный ключ сервера (из лога сервера)")
+	sni := flag.String("sni", "", "домен в TLS (SNI); по умолчанию — хост из -server")
+	pin := flag.String("pin", "", "отпечаток сертификата сервера (для самоподписанного)")
 	keyFile := flag.String("key", "client.key", "файл приватного ключа клиента (создаётся при первом запуске)")
 	addr := flag.String("addr", "10.8.0.2/24", "адрес TUN на клиенте")
 	mtu := flag.Int("mtu", 1400, "MTU туннеля")
@@ -37,31 +37,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	conn, err := net.DialTimeout("tcp", *server, 10*time.Second)
+	sess, conn, err := transport.Dial(transport.DialConfig{
+		Addr: *server, SNI: *sni, Pin: *pin, Static: priv, ServerPub: spub,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	in, msg1, err := noise.NewInitiator(priv, spub, uint64(time.Now().UnixNano()))
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := frame.Write(conn, msg1); err != nil {
-		log.Fatal(err)
-	}
-	msg2, err := frame.Read(conn, make([]byte, noise.Msg2Size))
-	if err != nil {
-		log.Fatalf("сервер отклонил подключение (неверный ключ или ключ клиента не добавлен в -allow): %v", err)
-	}
-	k, err := in.Finish(msg2)
-	if err != nil {
-		log.Fatal(err)
-	}
-	conn.SetDeadline(time.Time{})
-	sess, err := noise.NewSession(k, conn, frame.Write, frame.Read)
-	if err != nil {
-		log.Fatal(err)
-	}
+	defer conn.Close()
 
 	dev, err := tun.Open("vpn0")
 	if err != nil {
@@ -70,6 +52,6 @@ func main() {
 	if err := dev.Up(*addr, *mtu); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("подключён к %s, канал зашифрован, туннель %s", *server, *addr)
+	log.Printf("подключён к %s по HTTPS, канал зашифрован, туннель %s", *server, *addr)
 	log.Fatal(frame.Pipe(dev, sess))
 }

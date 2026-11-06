@@ -1,26 +1,35 @@
-// Сервер этапа 1.2: шифрованный туннель (Noise IK), доступ только для разрешённых ключей.
+// Сервер этапа 1.3: туннель внутри HTTPS на 443. Посторонние видят обычный сайт.
 package main
 
 import (
-	"crypto/ecdh"
+	"crypto/tls"
 	"flag"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/frame"
 	"github.com/extree-dev/vpn-tls/internal/keys"
 	"github.com/extree-dev/vpn-tls/internal/noise"
+	"github.com/extree-dev/vpn-tls/internal/transport"
 	"github.com/extree-dev/vpn-tls/internal/tun"
 )
 
 func main() {
-	listen := flag.String("listen", ":8443", "адрес для входящих подключений")
+	listen := flag.String("listen", ":443", "адрес для входящих подключений")
 	addr := flag.String("addr", "10.8.0.1/24", "адрес TUN на сервере")
 	mtu := flag.Int("mtu", 1400, "MTU туннеля")
 	keyFile := flag.String("key", "server.key", "файл приватного ключа сервера (создаётся при первом запуске)")
 	allow := flag.String("allow", "", "публичные ключи клиентов через запятую")
+	certFile := flag.String("cert", "tls.crt", "TLS-сертификат (если файла нет — создаётся самоподписанный)")
+	certKey := flag.String("cert-key", "tls.key", "приватный ключ TLS-сертификата")
+	domain := flag.String("domain", "localhost", "домен для самоподписанного сертификата")
+	fallback := flag.String("fallback", "", "URL сайта, который видят посторонние (по умолчанию — встроенная заглушка)")
 	flag.Parse()
 
 	priv, created, err := keys.LoadOrCreate(*keyFile)
@@ -31,6 +40,15 @@ func main() {
 		log.Printf("создан новый ключ сервера: %s", *keyFile)
 	}
 	log.Printf("публичный ключ сервера: %s", keys.PublicString(priv))
+
+	cert, fp, created, err := transport.LoadOrCreateCert(*certFile, *certKey, *domain)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if created {
+		log.Printf("создан самоподписанный сертификат для %s: %s", *domain, *certFile)
+	}
+	log.Printf("отпечаток сертификата (для -pin клиента): %s", fp)
 
 	allowed := map[string]bool{}
 	for _, s := range strings.Split(*allow, ",") {
@@ -47,6 +65,19 @@ func main() {
 		log.Fatal("не задан ни один клиент: укажите -allow <публичный ключ клиента>")
 	}
 
+	var site http.Handler = transport.StubSite
+	if *fallback != "" {
+		u, err := url.Parse(*fallback)
+		if err != nil {
+			log.Fatal(err)
+		}
+		rp := httputil.NewSingleHostReverseProxy(u)
+		base := rp.Director
+		rp.Director = func(r *http.Request) { base(r); r.Host = u.Host }
+		rp.ErrorLog = transport.QuietLog
+		site = rp
+	}
+
 	dev, err := tun.Open("vpn0")
 	if err != nil {
 		log.Fatal(err)
@@ -56,61 +87,61 @@ func main() {
 	}
 	log.Printf("TUN %s поднят, адрес %s", dev.Name, *addr)
 
-	ln, err := net.Listen("tcp", *listen)
-	if err != nil {
-		log.Fatal(err)
+	sessions := &single{}
+	h := &transport.Handler{
+		Priv:     priv,
+		Allowed:  allowed,
+		Fallback: site,
+		OnSession: func(sess *noise.Session, conn net.Conn, client string) {
+			sessions.run(conn, func() error {
+				log.Printf("клиент подключён: %s (%s…)", conn.RemoteAddr(), client[:8])
+				return frame.Pipe(dev, sess)
+			})
+		},
 	}
-	log.Printf("слушаю %s, разрешено клиентов: %d", *listen, len(allowed))
-
-	lastTS := map[string]uint64{} // защита от повтора рукопожатия (сбрасывается при перезапуске)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Print(err)
-			continue
-		}
-		sess, client, err := handshake(conn, priv, allowed, lastTS)
-		if err != nil {
-			log.Printf("%s: отклонён: %v", conn.RemoteAddr(), err)
-			conn.Close()
-			continue
-		}
-		log.Printf("клиент подключён: %s (%s…)", conn.RemoteAddr(), client[:8])
-		err = frame.Pipe(dev, sess) // пока один клиент за раз
-		conn.Close()
-		log.Printf("клиент отключён: %v", err)
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ErrorLog:          transport.QuietLog,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"http/1.1"},
+		},
+		// HTTP/2 выключен: туннелю нужен «сырой» поток после ответа.
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
+	log.Printf("слушаю %s (HTTPS), разрешено клиентов: %d", *listen, len(allowed))
+	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
-func handshake(conn net.Conn, priv *ecdh.PrivateKey, allowed map[string]bool, lastTS map[string]uint64) (*noise.Session, string, error) {
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	defer conn.SetDeadline(time.Time{})
+// single держит одну активную сессию: новое подключение вытесняет старое.
+// (Несколько одновременных клиентов с разными адресами — на следующих этапах.)
+type single struct {
+	mu   sync.Mutex
+	conn net.Conn
+	done chan struct{}
+}
 
-	buf := make([]byte, noise.Msg1Size)
-	msg, err := frame.Read(conn, buf)
-	if err != nil {
-		return nil, "", err
+func (s *single) run(conn net.Conn, pipe func() error) {
+	s.mu.Lock()
+	if s.conn != nil {
+		s.conn.Close()
+		<-s.done
 	}
-	req, err := noise.ReadRequest(priv, msg)
-	if err != nil {
-		return nil, "", err
-	}
-	id := string(req.ClientPub.Bytes())
-	if !allowed[id] {
-		return nil, "", noise.ErrHandshake
-	}
-	if req.Timestamp <= lastTS[id] {
-		return nil, "", noise.ErrHandshake // повтор старого сообщения
-	}
-	lastTS[id] = req.Timestamp
+	done := make(chan struct{})
+	s.conn, s.done = conn, done
+	s.mu.Unlock()
 
-	resp, k, err := req.Accept()
-	if err != nil {
-		return nil, "", err
+	err := pipe()
+	log.Printf("клиент отключён: %v", err)
+
+	s.mu.Lock()
+	if s.conn == conn {
+		s.conn = nil
 	}
-	if err := frame.Write(conn, resp); err != nil {
-		return nil, "", err
-	}
-	sess, err := noise.NewSession(k, conn, frame.Write, frame.Read)
-	return sess, keys.EncodePublic(req.ClientPub), err
+	s.mu.Unlock()
+	close(done)
 }
