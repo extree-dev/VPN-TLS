@@ -47,13 +47,28 @@ func TestHandshakeAndSession(t *testing.T) {
 	}
 
 	a, b := net.Pipe()
-	cs, _ := NewSession(ck, a, frame.Write, frame.Read)
-	ss, _ := NewSession(sk, b, frame.Write, frame.Read)
-	for _, msg := range [][]byte{[]byte("hello"), bytes.Repeat([]byte{7}, 1400), {}} {
-		go cs.WritePacket(msg)
+	cs, _ := NewSession(ck, a, frame.Read)
+	ss, _ := NewSession(sk, b, frame.Read)
+	msgs := [][]byte{[]byte("hello"), bytes.Repeat([]byte{7}, 1400), {}, []byte("x"), bytes.Repeat([]byte{9}, 1500)}
+	opts := []SendOpts{
+		{Pad: 5, Flush: true},
+		{Pad: 900, Fragment: true, Flush: true},   // крупный padding + фрагменты
+		{Pad: 300, Flush: true},                   // keepalive
+		{Pad: 70000, Fragment: true, Flush: true}, // padding больше кадра — обрезается
+		{Pad: 0}, // в буфер, без отправки…
+	}
+	go func() {
+		for i, m := range msgs {
+			if err := cs.Send(m, opts[i]); err != nil {
+				t.Error(err)
+			}
+		}
+		cs.Flush() // …и отправка буфера
+	}()
+	for _, msg := range msgs {
 		got, err := ss.ReadPacket(make([]byte, 2000))
 		if err != nil || !bytes.Equal(got, msg) {
-			t.Fatalf("roundtrip: %v", err)
+			t.Fatalf("roundtrip %d байт: %v", len(msg), err)
 		}
 	}
 }

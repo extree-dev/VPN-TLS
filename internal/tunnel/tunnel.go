@@ -11,16 +11,17 @@ import (
 	"github.com/extree-dev/vpn-tls/internal/noise"
 )
 
-// Link обслуживает одну сессию: отправляет пакеты из out (и keepalive, если
-// канал простаивает), принятые пакеты отдаёт в deliver. Возвращается, когда
-// соединение рвётся или от собеседника ничего не приходит 3×keepalive.
+// Link обслуживает одну сессию: отправляет пакеты из out (с маскировкой
+// размеров, см. shape.go) и keepalive через случайные интервалы, принятые
+// пакеты отдаёт в deliver. Возвращается, когда соединение рвётся или от
+// собеседника ничего не приходит 3×keepalive.
 func Link(sess *noise.Session, conn net.Conn, out <-chan []byte, deliver func([]byte) error, keepalive time.Duration) error {
 	done := make(chan struct{})
 	werr := make(chan error, 1)
 	go func() {
-		t := time.NewTicker(keepalive / 3)
-		defer t.Stop()
-		last := time.Now()
+		var f flows
+		idle := time.NewTimer(jitter(keepalive))
+		defer idle.Stop()
 		for {
 			var err error
 			select {
@@ -28,19 +29,22 @@ func Link(sess *noise.Session, conn net.Conn, out <-chan []byte, deliver func([]
 				werr <- nil
 				return
 			case p := <-out:
-				err = sess.WritePacket(p)
-				last = time.Now()
-			case <-t.C:
-				if time.Since(last) >= keepalive {
-					err = sess.WriteKeepalive()
-					last = time.Now()
-				}
+				err = sess.Send(p, sendOpts(&f, p, len(out)))
+			case <-idle.C:
+				err = sess.WriteKeepalive()
 			}
 			if err != nil {
 				conn.Close()
 				werr <- err
 				return
 			}
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(jitter(keepalive))
 		}
 	}()
 

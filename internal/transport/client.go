@@ -136,7 +136,7 @@ func dial(cfg DialConfig) (*noise.Session, net.Conn, []byte, error) {
 		io.Reader
 		io.Writer
 	}{br, uc}
-	sess, err := noise.NewSession(k, rw, frame.Write, frame.Read)
+	sess, err := noise.NewSession(k, rw, frame.Read)
 	if err != nil {
 		return nil, nil, nil, err
 	}
