@@ -2,7 +2,7 @@ name: Windows
 
 on:
   push:
-    paths: ['cmd/vpntls-windows/**', 'mobile/**', 'internal/**', 'go.mod', 'go.sum', '.github/workflows/windows.yml']
+    paths: ['cmd/vpntls-windows/**', 'assets/**', 'mobile/**', 'internal/**', 'go.mod', 'go.sum', '.github/workflows/windows.yml']
   workflow_dispatch:
 
 jobs:
@@ -21,7 +21,8 @@ jobs:
       - name: Сборка vpntls.exe
         run: |
           GOOS=windows GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
-            go build -trimpath -ldflags "-H windowsgui -s -w" -o dist/VPN-TLS.exe ./cmd/vpntls-windows
+            go build -trimpath -ldflags "-H windowsgui -s -w -X main.appVersion=0.2.${{ github.run_number }}" \
+            -o dist/VPN-TLS.exe ./cmd/vpntls-windows
 
       - name: Драйвер Wintun (wintun.net)
         run: |

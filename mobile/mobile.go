@@ -17,6 +17,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/config"
@@ -47,7 +48,15 @@ type Tunnel struct {
 	conn   net.Conn
 	closed bool
 	stop   chan struct{}
+
+	rx, tx atomic.Int64 // байты из туннеля и в туннель
 }
+
+// RxBytes — сколько байт пришло из туннеля (скачано).
+func (t *Tunnel) RxBytes() int64 { return t.rx.Load() }
+
+// TxBytes — сколько байт ушло в туннель (отправлено).
+func (t *Tunnel) TxBytes() int64 { return t.tx.Load() }
 
 // tunnelSettings — то, что нужно системе для настройки VPN (уходит наружу JSON).
 type tunnelSettings struct {
@@ -114,6 +123,7 @@ func (t *Tunnel) WritePacket(p []byte) {
 	}
 	select {
 	case t.out <- append([]byte(nil), p...):
+		t.tx.Add(int64(len(p)))
 	default:
 	}
 }
@@ -143,6 +153,7 @@ func (t *Tunnel) run(sess *noise.Session, conn net.Conn, ka time.Duration) {
 	for {
 		t.status("connected", "")
 		err := tunnel.Link(sess, conn, t.out, func(p []byte) error {
+			t.rx.Add(int64(len(p)))
 			t.w.WritePacket(p)
 			return nil
 		}, ka)
