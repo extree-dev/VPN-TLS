@@ -1,4 +1,4 @@
-// Package mobile — ядро VPN для мобильных приложений (iOS, позже Android).
+// Package mobile — ядро VPN-клиента для приложений (iOS, Windows, позже Android).
 // Собирается через gomobile bind; наружу торчит только простой API:
 //
 //	t, err := mobile.Connect(link, writer, listener) // подключиться
@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -61,8 +62,10 @@ type tunnelSettings struct {
 // Connect разбирает ссылку vpntls://, подключается и возвращает туннель.
 // Первое подключение синхронное: настройки нужны системе до старта.
 func Connect(link string, w PacketWriter, l Listener) (*Tunnel, error) {
-	// У расширения VPN на iOS жёсткий лимит памяти (~50 МБ).
-	debug.SetMemoryLimit(32 << 20)
+	if runtime.GOOS == "ios" {
+		// У расширения VPN на iOS жёсткий лимит памяти (~50 МБ).
+		debug.SetMemoryLimit(32 << 20)
+	}
 
 	lk, err := config.ParseLink(link)
 	if err != nil {
