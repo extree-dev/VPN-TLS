@@ -55,8 +55,10 @@ func Open(name string) (*Device, error) {
 }
 
 // Up назначает адрес (CIDR, например 10.8.0.1/24), MTU и поднимает интерфейс.
+// Прежние адреса интерфейса снимаются, поэтому Up можно вызывать повторно.
 func (d *Device) Up(cidr string, mtu int) error {
 	cmds := [][]string{
+		{"ip", "addr", "flush", "dev", d.Name},
 		{"ip", "addr", "add", cidr, "dev", d.Name},
 		{"ip", "link", "set", "dev", d.Name, "mtu", fmt.Sprint(mtu), "up"},
 	}

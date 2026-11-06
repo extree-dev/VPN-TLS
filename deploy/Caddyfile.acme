@@ -1,0 +1,21 @@
+# Caddy с настоящим сертификатом Let's Encrypt для DOMAIN (DNS-01 через Cloudflare).
+{
+	admin off
+	auto_https disable_redirects
+	default_sni {$DOMAIN}
+	servers {
+		# Туннелю нужен HTTP/1.1 Upgrade, поэтому HTTP/2 и HTTP/3 выключены.
+		protocols h1
+	}
+}
+
+{$DOMAIN}:443 {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+
+	reverse_proxy {$VPN_PATH} vpn:8080
+
+	root * /srv
+	file_server
+}

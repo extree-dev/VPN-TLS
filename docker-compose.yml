@@ -12,19 +12,27 @@ services:
       - net.ipv4.ip_forward=1
     volumes:
       - ./data:/data
-    command:
-      - -plain=:8080
-      - -path=${VPN_PATH:-/api/stream}
-      - -allow-file=/data/clients.txt
-      - -domain=${DOMAIN:-localhost}
-      - -nat
+    environment:
+      VPN_PLAIN: ":8080"
+      VPN_PATH: ${VPN_PATH:-/api/stream}
+      VPN_DOMAIN: ${DOMAIN:-localhost}
+      VPN_PUBLIC: ${PUBLIC_ADDR:-}
+      VPN_PUBLIC_PORT: ${PORT:-443}
+      VPN_CLIENTS: /data/clients.txt
+      VPN_DNS: ${DNS:-1.1.1.1,1.0.0.1}
+      VPN_NAT: "1"
+      # С настоящим сертификатом (CADDYFILE=Caddyfile.acme) pin в строках не нужен.
+      VPN_PIN: ${PIN:-auto}
     healthcheck:
       test: ["CMD", "test", "-f", "/data/tls.crt"]
       interval: 2s
       retries: 15
 
   caddy:
-    image: caddy:2-alpine
+    build:
+      context: ./deploy
+      dockerfile: caddy.Dockerfile
+    image: vpn-tls-caddy
     container_name: vpn-tls-caddy
     restart: unless-stopped
     depends_on:
@@ -35,8 +43,9 @@ services:
     environment:
       DOMAIN: ${DOMAIN:-localhost}
       VPN_PATH: ${VPN_PATH:-/api/stream}
+      CF_API_TOKEN: ${CF_API_TOKEN:-}
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - ./deploy/site:/srv:ro
       - ./data:/vpn-data:ro
       - caddy_data:/data

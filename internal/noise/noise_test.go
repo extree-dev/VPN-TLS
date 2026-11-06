@@ -31,13 +31,16 @@ func keypair(t *testing.T) (*Initiator, []byte, *Request) {
 
 func TestHandshakeAndSession(t *testing.T) {
 	in, _, req := keypair(t)
-	m2, sk, err := req.Accept()
+	m2, sk, err := req.Accept([]byte(`{"ip":"10.8.0.2/24"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ck, err := in.Finish(m2)
+	ck, payload, err := in.Finish(m2)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if string(payload) != `{"ip":"10.8.0.2/24"}` {
+		t.Fatalf("payload %q", payload)
 	}
 	if ck.Send != sk.Recv || ck.Recv != sk.Send || ck.Send == ck.Recv {
 		t.Fatal("transport keys mismatch")
