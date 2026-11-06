@@ -3,76 +3,192 @@
 <head>
 <meta charset="utf-8">
 <style>
-  :root { color-scheme: light dark; --ok: #1f9d55; --muted: #8a8f98; --err: #d93025; }
+  :root {
+    --bg: #f3f4f6; --card: #ffffff; --text: #111827; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #2563eb; --ok: #16a34a; --wait: #d97706; --off: #9ca3af; --err-bg: #fef2f2; --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111318; --card: #1b1e25; --text: #f3f4f6; --muted: #9ca3af; --line: #2a2f39;
+            --err-bg: #3b1717; --err: #fca5a5; --off: #4b5563; }
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; padding: 28px 24px; user-select: none; }
-  h1 { font-size: 22px; margin: 0 0 20px; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 14px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+         user-select: none; display: flex; flex-direction: column; overflow: hidden; }
+  header { display: flex; align-items: center; gap: 10px; padding: 16px 20px 8px; }
+  header img { width: 28px; height: 28px; }
+  header .title { font-size: 16px; font-weight: 600; }
+  header .ver { margin-left: auto; color: var(--muted); font-size: 12px; }
+  main { flex: 1; overflow-y: auto; padding: 4px 20px 8px; }
+  main::-webkit-scrollbar { width: 8px; } main::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; margin-bottom: 10px; }
   .hidden { display: none !important; }
-  .hint { color: var(--muted); font-size: 13px; line-height: 1.4; margin-bottom: 10px; }
-  textarea { width: 100%; height: 150px; font: 12px Consolas, monospace; padding: 8px; border-radius: 8px;
-             border: 1px solid #8884; resize: none; user-select: text; }
-  .row { display: flex; justify-content: flex-end; margin-top: 12px; }
-  button.primary { background: #2563eb; color: #fff; border: 0; border-radius: 8px; padding: 9px 18px; font-size: 14px; cursor: pointer; }
-  button.primary:disabled { opacity: .5; cursor: default; }
-  #main { display: flex; flex-direction: column; align-items: center; gap: 14px; }
-  #power { width: 170px; height: 170px; border-radius: 50%; border: 0; background: #8883; cursor: pointer;
-           display: flex; align-items: center; justify-content: center; transition: background .2s; margin-top: 16px; }
-  #power svg { width: 64px; height: 64px; stroke: #fff; }
-  #power.on { background: var(--ok); }
-  #power.busy { background: #d6a100; }
-  #status { font-size: 20px; font-weight: 600; }
-  #name { font-weight: 600; }
-  #server { color: var(--muted); font-size: 13px; }
-  #error { color: var(--err); font-size: 13px; text-align: center; min-height: 18px; max-width: 360px; }
-  a.link { color: var(--err); font-size: 13px; cursor: pointer; margin-top: 30px; text-decoration: underline; }
+
+  /* Главная кнопка */
+  .hero { display: flex; flex-direction: column; align-items: center; padding: 18px 16px 14px; }
+  #power { width: 108px; height: 108px; border-radius: 50%; border: 0; cursor: pointer; background: var(--off);
+           display: grid; place-items: center; transition: background .25s, box-shadow .25s, transform .1s; outline: none; }
+  #power:active { transform: scale(.97); }
+  #power svg { width: 44px; height: 44px; stroke: #fff; }
+  #power.on { background: var(--ok); box-shadow: 0 0 0 10px color-mix(in srgb, var(--ok) 18%, transparent); }
+  #power.busy { background: var(--wait); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 12px color-mix(in srgb, var(--wait) 22%, transparent); } }
+  #status { font-size: 19px; font-weight: 600; margin-top: 14px; }
+  #sub { color: var(--muted); margin-top: 4px; min-height: 18px; font-variant-numeric: tabular-nums; }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .stat .label { color: var(--muted); font-size: 12px; }
+  .stat .speed { font-size: 18px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .stat .total { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .row .k { color: var(--muted); }
+  .row .v { font-weight: 500; text-align: right; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+  h3 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+
+  /* Переключатели */
+  .switch { position: relative; width: 40px; height: 22px; flex: none; }
+  .switch input { display: none; }
+  .switch span { position: absolute; inset: 0; background: var(--off); border-radius: 22px; transition: .2s; cursor: pointer; }
+  .switch span::after { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(18px); }
+
+  #error { background: var(--err-bg); color: var(--err); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; line-height: 1.35; }
+
+  textarea { width: 100%; height: 130px; margin-top: 10px; padding: 10px; border-radius: 8px; border: 1px solid var(--line);
+             background: var(--bg); color: var(--text); font: 12px Consolas, monospace; resize: none; user-select: text; outline: none; }
+  textarea:focus { border-color: var(--accent); }
+  .btn { border: 0; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.primary:disabled { opacity: .5; cursor: default; }
+  .btn.link { background: none; color: var(--muted); padding: 4px 6px; font-weight: 400; }
+  .btn.link:hover { color: var(--text); }
+  .btn.danger { color: var(--err); }
+  .hint { color: var(--muted); line-height: 1.45; }
+  .actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+
+  footer { display: flex; justify-content: space-between; padding: 6px 14px 12px; }
 </style>
 </head>
 <body>
-<h1>VPN-TLS</h1>
+<header>
+  <img src="data:image/png;base64,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" alt="">
+  <div class="title">VPN-TLS</div>
+  <div class="ver" id="ver"></div>
+</header>
 
-<div id="setup" class="hidden">
-  <div class="hint">Вставьте строку подключения <b>vpntls://</b> (Ctrl+V). Её выдаёт команда
-    «vpn-server client add» на сервере.</div>
-  <textarea id="link" spellcheck="false" placeholder="vpntls://…"></textarea>
-  <div class="row"><button id="save" class="primary">Сохранить</button></div>
-</div>
+<main>
+  <div id="error" class="hidden"></div>
 
-<div id="main" class="hidden">
-  <button id="power" title="Подключить / отключить">
-    <svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round">
-      <path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/>
-    </svg>
-  </button>
-  <div id="status"></div>
-  <div id="name"></div>
-  <div id="server"></div>
-  <a class="link" id="remove">Удалить профиль</a>
-</div>
+  <!-- Нет профиля -->
+  <section id="setup" class="card hidden">
+    <h3>Новое подключение</h3>
+    <div class="hint">Вставьте строку подключения <b>vpntls://</b> (Ctrl+V). Её выдаёт команда
+      <code>vpn-server client add</code> на сервере. Строка — это ключ доступа, храните её как пароль.</div>
+    <textarea id="link" spellcheck="false" placeholder="vpntls://…"></textarea>
+    <div class="actions"><button id="save" class="btn primary" disabled>Сохранить</button></div>
+  </section>
 
-<div id="error"></div>
+  <!-- Есть профиль -->
+  <section id="main" class="hidden">
+    <div class="card hero">
+      <button id="power" title="Подключить / отключить">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/></svg>
+      </button>
+      <div id="status"></div>
+      <div id="sub"></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="label">↓ Загрузка</div><div class="speed" id="down">—</div><div class="total" id="rx"></div></div>
+      <div class="stat"><div class="label">↑ Отдача</div><div class="speed" id="up">—</div><div class="total" id="tx"></div></div>
+    </div>
+    <div style="height:10px"></div>
+
+    <div class="card">
+      <h3>Подключение</h3>
+      <div class="row"><span class="k">Профиль</span><span class="v" id="name"></span></div>
+      <div class="row"><span class="k">Сервер</span><span class="v" id="server"></span></div>
+      <div class="row"><span class="k">Адрес в туннеле</span><span class="v" id="tip">—</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Настройки</h3>
+      <div class="row"><span>Подключаться при запуске</span><label class="switch"><input type="checkbox" id="sAuto"><span></span></label></div>
+      <div class="row"><span>Сворачивать в трей при закрытии</span><label class="switch"><input type="checkbox" id="sTray"><span></span></label></div>
+      <div class="row"><span>Уведомления</span><label class="switch"><input type="checkbox" id="sNotify"><span></span></label></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>
+    <button class="btn link" id="logs">Журнал</button>
+    <button class="btn link danger hidden" id="remove">Удалить профиль</button>
+  </span>
+  <button class="btn link" id="quit">Выход</button>
+</footer>
 
 <script>
 const $ = id => document.getElementById(id);
 const names = { off: "Отключено", connecting: "Подключение…", connected: "Подключено", reconnecting: "Переподключение…" };
-let localError = "";
+let localError = "", last = null, settingsLoaded = false;
+
+const fmtBytes = b => b < 1024 ? b + " Б" : b < 1048576 ? (b / 1024).toFixed(1) + " КБ"
+  : b < 1073741824 ? (b / 1048576).toFixed(1) + " МБ" : (b / 1073741824).toFixed(2) + " ГБ";
+const fmtSpeed = bps => bps < 1 ? "0 бит/с" : bps * 8 < 1e6 ? (bps * 8 / 1e3).toFixed(0) + " Кбит/с" : (bps * 8 / 1e6).toFixed(1) + " Мбит/с";
+const fmtTime = ms => { const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60;
+  return (h ? h + ":" : "") + String(m).padStart(h ? 2 : 1, "0") + ":" + String(s % 60).padStart(2, "0"); };
 
 async function refresh() {
   let s;
   try { s = await window.vpnState(); } catch (e) { return; }
+  $("ver").textContent = "v" + s.version;
   $("setup").classList.toggle("hidden", s.hasProfile);
   $("main").classList.toggle("hidden", !s.hasProfile);
+  $("remove").classList.toggle("hidden", !s.hasProfile);
+
+  const err = localError || s.error;
+  $("error").textContent = err || "";
+  $("error").classList.toggle("hidden", !err);
+
+  if (!settingsLoaded) {
+    $("sAuto").checked = s.settings.autoConnect;
+    $("sTray").checked = s.settings.closeToTray;
+    $("sNotify").checked = s.settings.notify;
+    settingsLoaded = true;
+  }
+  if (!s.hasProfile) return;
+
   $("status").textContent = names[s.status] || s.status;
-  $("name").textContent = s.name || "";
-  $("server").textContent = s.server || "";
   const p = $("power");
   p.classList.toggle("on", s.status === "connected");
   p.classList.toggle("busy", s.status === "connecting" || s.status === "reconnecting");
-  $("error").textContent = localError || s.error || "";
+  $("sub").textContent = s.since ? "В сети " + fmtTime(Date.now() - s.since) : s.status === "off" ? "Нажмите, чтобы подключиться" : "";
+  $("name").textContent = s.name || "—";
+  $("server").textContent = s.server || "—";
+  $("tip").textContent = s.tunnelIp ? s.tunnelIp.split("/")[0] : "—";
+
+  const now = Date.now();
+  if (s.since && last && last.since === s.since) {
+    const dt = (now - last.at) / 1000;
+    $("down").textContent = fmtSpeed(Math.max(0, s.rx - last.rx) / dt);
+    $("up").textContent = fmtSpeed(Math.max(0, s.tx - last.tx) / dt);
+  } else if (!s.since) {
+    $("down").textContent = "—"; $("up").textContent = "—";
+  }
+  $("rx").textContent = s.since ? "всего " + fmtBytes(s.rx) : "";
+  $("tx").textContent = s.since ? "всего " + fmtBytes(s.tx) : "";
+  last = { rx: s.rx, tx: s.tx, at: now, since: s.since };
 }
 
+$("link").oninput = () => { $("save").disabled = !$("link").value.trim(); };
 $("save").onclick = async () => {
   localError = "";
-  try { await window.vpnSave($("link").value.trim()); $("link").value = ""; }
+  try { await window.vpnSave($("link").value.trim()); $("link").value = ""; $("save").disabled = true; }
   catch (e) { localError = String(e.message || e); }
   refresh();
 };
@@ -80,10 +196,16 @@ $("power").onclick = async () => { localError = ""; await window.vpnToggle(); re
 $("remove").onclick = async () => {
   if (confirm("Удалить профиль? Понадобится снова вставить строку подключения.")) { await window.vpnRemove(); refresh(); }
 };
+$("logs").onclick = () => window.vpnOpenLogs();
+$("quit").onclick = () => window.vpnQuit();
+const saveSettings = () => window.vpnSetSettings({
+  autoConnect: $("sAuto").checked, closeToTray: $("sTray").checked, notify: $("sNotify").checked });
+["sAuto", "sTray", "sNotify"].forEach(id => $(id).onchange = saveSettings);
 document.addEventListener("contextmenu", e => { if (e.target.id !== "link") e.preventDefault(); });
+document.addEventListener("keydown", e => { if (e.key === "F5" || (e.ctrlKey && e.key === "r")) e.preventDefault(); });
 
 refresh();
-setInterval(refresh, 700);
+setInterval(refresh, 1000);
 </script>
 </body>
 </html>

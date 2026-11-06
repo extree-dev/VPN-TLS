@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/config"
 	"github.com/extree-dev/vpn-tls/internal/tun"
@@ -30,15 +32,26 @@ type controller struct {
 	dev    *tun.Device
 	undo   func()
 	gen    int // номер попытки: устаревшие события старого туннеля игнорируются
+	since  time.Time
+	tunIP  string
+
+	// onChange вызывается после смены состояния (вне блокировки).
+	onChange func(status, err string)
 }
 
 // State — то, что показывает окно.
 type State struct {
-	HasProfile bool   `json:"hasProfile"`
-	Name       string `json:"name"`
-	Server     string `json:"server"`
-	Status     string `json:"status"`
-	Error      string `json:"error"`
+	HasProfile bool     `json:"hasProfile"`
+	Name       string   `json:"name"`
+	Server     string   `json:"server"`
+	Status     string   `json:"status"`
+	Error      string   `json:"error"`
+	Since      int64    `json:"since"` // начало сессии, мс Unix (0 — не подключено)
+	RX         int64    `json:"rx"`
+	TX         int64    `json:"tx"`
+	TunnelIP   string   `json:"tunnelIp"`
+	Settings   Settings `json:"settings"`
+	Version    string   `json:"version"`
 }
 
 func newController(profile string) *controller {
@@ -52,11 +65,33 @@ func newController(profile string) *controller {
 func (c *controller) state() State {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := State{HasProfile: c.link != "", Status: c.status, Error: c.err}
+	s := State{HasProfile: c.link != "", Status: c.status, Error: c.err, TunnelIP: c.tunIP, Version: appVersion}
 	if l, err := config.ParseLink(c.link); err == nil {
 		s.Name, s.Server = l.Name, l.Addr
 	}
+	if c.t != nil {
+		s.RX, s.TX = c.t.RxBytes(), c.t.TxBytes()
+	}
+	if !c.since.IsZero() {
+		s.Since = c.since.UnixMilli()
+	}
 	return s
+}
+
+// changed сообщает о новом состоянии (вызывать без блокировки).
+func (c *controller) changed() {
+	c.mu.Lock()
+	st, e, f := c.status, c.err, c.onChange
+	c.mu.Unlock()
+	if f != nil {
+		f(st, e)
+	}
+}
+
+func (c *controller) isOn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status != "off"
 }
 
 func (c *controller) save(link string) error {
@@ -101,13 +136,15 @@ func (c *controller) connect() {
 	gen, link := c.gen, c.link
 	c.status, c.err = "connecting", ""
 	c.mu.Unlock()
+	c.changed()
 
 	fail := func(err error) {
 		log.Printf("подключение: %v", err)
 		c.disconnect()
 		c.mu.Lock()
-		c.err = err.Error()
+		c.err = humanError(err)
 		c.mu.Unlock()
+		c.changed()
 	}
 
 	dev, err := tun.Open(ifaceName)
@@ -153,11 +190,15 @@ func (c *controller) connect() {
 		return
 	}
 	c.mu.Lock()
-	c.undo = undo
-	if c.status == "connecting" {
-		c.status = "connected"
+	if c.gen != gen { // пока подключались, пользователь нажал «отключить»
+		c.mu.Unlock()
+		undo()
+		return
 	}
+	c.undo = undo
+	c.status, c.since, c.tunIP = "connected", time.Now(), s.IP
 	c.mu.Unlock()
+	c.changed()
 	log.Printf("подключено: %s", t.Settings())
 
 	go func() {
@@ -175,10 +216,14 @@ func (c *controller) connect() {
 func (c *controller) disconnect() {
 	c.mu.Lock()
 	t, dev, undo := c.t, c.dev, c.undo
+	was := c.status
 	c.t, c.dev, c.undo = nil, nil, nil
-	c.status = "off"
+	c.status, c.since, c.tunIP = "off", time.Time{}, ""
 	c.gen++
 	c.mu.Unlock()
+	if was != "off" {
+		defer c.changed()
+	}
 	if t != nil {
 		t.Close()
 	}
@@ -206,6 +251,7 @@ func (l listener) OnStatus(state, detail string) {
 		c.mu.Unlock()
 		return
 	}
+	prev := c.status
 	switch state {
 	case "connected":
 		if c.undo != nil {
@@ -214,17 +260,40 @@ func (l listener) OnStatus(state, detail string) {
 		c.err = ""
 	case "reconnecting":
 		c.status = "reconnecting"
-		c.err = detail
+		c.err = humanError(errors.New(detail))
 	case "failed":
 		c.mu.Unlock()
 		log.Printf("отказ: %s", detail)
 		go func() {
 			c.disconnect()
 			c.mu.Lock()
-			c.err = detail
+			c.err = humanError(errors.New(detail))
 			c.mu.Unlock()
+			c.changed()
 		}()
 		return
 	}
+	now := c.status
 	c.mu.Unlock()
+	if now != prev {
+		c.changed()
+	}
+}
+
+// humanError — понятный текст для частых ошибок.
+func humanError(err error) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "отклонил"):
+		return "Сервер отклонил подключение: ключ отозван или строка подключения устарела."
+	case strings.Contains(s, "no such host"), strings.Contains(s, "нет IPv4"):
+		return "Не удаётся найти сервер. Проверьте подключение к интернету."
+	case strings.Contains(s, "i/o timeout"), strings.Contains(s, "connection refused"), strings.Contains(s, "временно недоступен"):
+		return "Сервер не отвечает. Повторяю попытку…"
+	case strings.Contains(s, "x509"), strings.Contains(s, "certificate"):
+		return "Не удалось проверить сертификат сервера."
+	case strings.Contains(s, "wintun"):
+		return "Не найден wintun.dll рядом с программой."
+	}
+	return s
 }
