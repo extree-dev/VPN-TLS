@@ -1,3 +1,3 @@
 module github.com/extree-dev/vpn-tls
 
-go 1.24
+go 1.22
