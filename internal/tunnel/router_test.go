@@ -30,3 +30,45 @@ func TestLease(t *testing.T) {
 		}
 	}
 }
+
+func tcpPacket(sport, dport uint16, syn bool) []byte {
+	p := make([]byte, 40)
+	p[0] = 0x45
+	p[9] = 6
+	copy(p[12:16], []byte{10, 8, 0, 2})
+	copy(p[16:20], []byte{1, 1, 1, 1})
+	p[20], p[21] = byte(sport>>8), byte(sport)
+	p[22], p[23] = byte(dport>>8), byte(dport)
+	if syn {
+		p[33] = 0x02
+	}
+	return p
+}
+
+func TestFlowsHeavy(t *testing.T) {
+	var f flows
+	a := tcpPacket(40000, 443, true)
+	for i := 0; i < heavyPackets; i++ {
+		if !f.heavy(a) {
+			t.Fatalf("пакет %d соединения должен маскироваться", i+1)
+		}
+		a = tcpPacket(40000, 443, false)
+	}
+	if f.heavy(a) {
+		t.Fatal("после первых пакетов маскировка должна выключаться")
+	}
+	if !f.heavy(tcpPacket(40001, 443, false)) {
+		t.Fatal("новое соединение (другой порт) должно маскироваться")
+	}
+	if !f.heavy(tcpPacket(40000, 443, true)) {
+		t.Fatal("новый SYN на том же порту должен сбрасывать счётчик")
+	}
+	if f.heavy([]byte{0x60, 0, 0, 0}) {
+		t.Fatal("не-IPv4 не маскируется")
+	}
+	for i := 0; i < 1000; i++ {
+		if n := heavyPad(100); 100+n < 600 || 100+n > 1400 {
+			t.Fatalf("размер после padding %d вне 600…1400", 100+n)
+		}
+	}
+}

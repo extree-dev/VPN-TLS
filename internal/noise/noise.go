@@ -10,6 +10,7 @@
 package noise
 
 import (
+	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -21,6 +22,7 @@ import (
 	"io"
 	"math"
 	mrand "math/rand/v2"
+	"time"
 )
 
 const (
@@ -296,29 +298,36 @@ func (r *Request) Accept(payload []byte) ([]byte, *Keys, error) {
 // Keys — ключи направлений после рукопожатия.
 type Keys struct{ Send, Recv [32]byte }
 
-// Session шифрует пакеты поверх потока. ReadPacket и WritePacket можно
-// вызывать параллельно друг с другом, но каждый — только из одной горутины.
+// Session шифрует пакеты поверх потока. ReadPacket можно вызывать параллельно
+// с Send/WritePacket/Flush, но каждую сторону — только из одной горутины.
 //
-// Открытый текст кадра: [2 байта длины пакета][пакет][случайный padding],
-// чтобы длины зашифрованных кадров не повторяли длины IP-пакетов.
+// Кадр в потоке: [2 байта длины шифротекста][шифротекст].
+// Открытый текст кадра: [2 байта длины пакета][пакет][padding] — длина
+// кадра не равна длине IP-пакета. Пакет нулевой длины — keepalive/шум.
 type Session struct {
 	w, r   cipher.AEAD
 	wn, rn uint64
+	bw     *bufio.Writer
 	rw     io.ReadWriter
-	write  func(io.Writer, []byte) error
 	read   func(io.Reader, []byte) ([]byte, error)
 	rbuf   []byte
 	pbuf   []byte
 	wbuf   []byte
+	cbuf   []byte
 }
 
-// MaxPadding — верхняя граница случайного padding на пакет.
-const MaxPadding = 128
+// MaxFrame — максимальный размер шифротекста кадра.
+const MaxFrame = 65535
 
-// NewSession создаёт сессию. write/read — функции кадрирования (см. пакет frame).
-func NewSession(k *Keys, rw io.ReadWriter,
-	write func(io.Writer, []byte) error,
-	read func(io.Reader, []byte) ([]byte, error)) (*Session, error) {
+// SendOpts — как отправить пакет.
+type SendOpts struct {
+	Pad      int  // байт padding (обрезается, если кадр не помещается)
+	Fragment bool // разбить кадр на 2–3 отдельные записи (разные TLS-записи снаружи)
+	Flush    bool // отправить сразу; иначе кадр ждёт в буфере следующего Flush
+}
+
+// NewSession создаёт сессию поверх rw. read — функция чтения кадра (frame.Read).
+func NewSession(k *Keys, rw io.ReadWriter, read func(io.Reader, []byte) ([]byte, error)) (*Session, error) {
 	w, err := newAEAD(k.Send[:])
 	if err != nil {
 		return nil, err
@@ -327,34 +336,79 @@ func NewSession(k *Keys, rw io.ReadWriter,
 	if err != nil {
 		return nil, err
 	}
-	return &Session{w: w, r: r, rw: rw, write: write, read: read,
-		rbuf: make([]byte, 65535), pbuf: make([]byte, 65535), wbuf: make([]byte, 0, 65535)}, nil
+	return &Session{w: w, r: r, rw: rw, read: read, bw: bufio.NewWriterSize(rw, 64<<10),
+		rbuf: make([]byte, MaxFrame), pbuf: make([]byte, MaxFrame),
+		wbuf: make([]byte, MaxFrame), cbuf: make([]byte, 0, 2+MaxFrame)}, nil
 }
 
-// WriteKeepalive отправляет пустой кадр: держит NAT и показывает, что канал жив.
-// Получатель увидит пакет нулевой длины и должен его пропустить.
-func (s *Session) WriteKeepalive() error { return s.WritePacket(nil) }
+// RandomPad — обычный padding пакета: 0…127 байт.
+func RandomPad() int { return mrand.IntN(128) }
 
-// WritePacket шифрует и отправляет один пакет.
+// WriteKeepalive отправляет пустой кадр случайного размера: держит NAT,
+// показывает, что канал жив, и не даёт отличить «тишину» по размеру кадров.
+func (s *Session) WriteKeepalive() error {
+	return s.Send(nil, SendOpts{Pad: 16 + mrand.IntN(512), Flush: true})
+}
+
+// WritePacket шифрует и сразу отправляет один пакет с обычным padding.
 func (s *Session) WritePacket(p []byte) error {
+	return s.Send(p, SendOpts{Pad: RandomPad(), Flush: true})
+}
+
+// Send шифрует пакет и пишет кадр в буфер (или сразу — см. SendOpts).
+func (s *Session) Send(p []byte, o SendOpts) error {
 	if s.wn == math.MaxUint64 {
 		return ErrNonce
 	}
-	pad := mrand.IntN(MaxPadding)
-	if 2+len(p)+pad+tagSize > 65535 {
-		pad = 0
-		if 2+len(p)+tagSize > 65535 {
-			return errors.New("noise: packet too large")
-		}
+	if 2+len(p)+tagSize > MaxFrame {
+		return errors.New("noise: packet too large")
 	}
+	pad := max(0, min(o.Pad, MaxFrame-2-len(p)-tagSize))
 	pt := s.wbuf[:2+len(p)+pad]
 	binary.BigEndian.PutUint16(pt, uint16(len(p)))
 	copy(pt[2:], p)
 	clear(pt[2+len(p):])
-	ct := s.w.Seal(nil, nonce(s.wn), pt, nil)
+	f := s.cbuf[:2]
+	f = s.w.Seal(f, nonce(s.wn), pt, nil)
 	s.wn++
-	return s.write(s.rw, ct)
+	binary.BigEndian.PutUint16(f, uint16(len(f)-2))
+
+	if !o.Fragment || len(f) < 64 {
+		if _, err := s.bw.Write(f); err != nil {
+			return err
+		}
+		if o.Flush {
+			return s.bw.Flush()
+		}
+		return nil
+	}
+	// Фрагменты уходят отдельными записями: снаружи размер записи не совпадает
+	// с размером кадра. Небольшая пауза не даёт склеить их обратно по дороге.
+	if err := s.bw.Flush(); err != nil {
+		return err
+	}
+	cuts := []int{1 + mrand.IntN(len(f)-1)}
+	if mrand.IntN(2) == 0 && cuts[0] > 32 {
+		cuts = append([]int{1 + mrand.IntN(cuts[0]-1)}, cuts...)
+	}
+	prev := 0
+	for i, c := range append(cuts, len(f)) {
+		if _, err := s.bw.Write(f[prev:c]); err != nil {
+			return err
+		}
+		if err := s.bw.Flush(); err != nil {
+			return err
+		}
+		if i < len(cuts) {
+			time.Sleep(time.Duration(500+mrand.IntN(1500)) * time.Microsecond)
+		}
+		prev = c
+	}
+	return nil
 }
+
+// Flush отправляет накопленные кадры.
+func (s *Session) Flush() error { return s.bw.Flush() }
 
 // ReadPacket читает и расшифровывает один пакет в buf.
 // Пакет нулевой длины — keepalive.

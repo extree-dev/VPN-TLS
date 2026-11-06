@@ -101,7 +101,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.Reader
 		io.Writer
 	}{brw.Reader, conn}
-	sess, err := noise.NewSession(k, rw, frame.Write, frame.Read)
+	sess, err := noise.NewSession(k, rw, frame.Read)
 	if err != nil {
 		return
 	}
