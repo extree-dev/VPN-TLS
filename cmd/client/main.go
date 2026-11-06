@@ -1,12 +1,17 @@
-// Консольный клиент этапа 1.3 (Linux): туннель внутри HTTPS с отпечатком Chrome.
+// Консольный клиент (Linux): туннель внутри HTTPS с отпечатком Chrome.
 package main
 
 import (
 	"flag"
 	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/extree-dev/vpn-tls/internal/frame"
 	"github.com/extree-dev/vpn-tls/internal/keys"
+	"github.com/extree-dev/vpn-tls/internal/route"
 	"github.com/extree-dev/vpn-tls/internal/transport"
 	"github.com/extree-dev/vpn-tls/internal/tun"
 )
@@ -19,6 +24,8 @@ func main() {
 	keyFile := flag.String("key", "client.key", "файл приватного ключа клиента (создаётся при первом запуске)")
 	addr := flag.String("addr", "10.8.0.2/24", "адрес TUN на клиенте")
 	mtu := flag.Int("mtu", 1400, "MTU туннеля")
+	path := flag.String("path", "/", "секретный путь туннеля на сервере")
+	routeAll := flag.Bool("route-all", false, "пустить весь трафик через туннель")
 	flag.Parse()
 
 	priv, created, err := keys.LoadOrCreate(*keyFile)
@@ -38,7 +45,7 @@ func main() {
 	}
 
 	sess, conn, err := transport.Dial(transport.DialConfig{
-		Addr: *server, SNI: *sni, Pin: *pin, Static: priv, ServerPub: spub,
+		Addr: *server, SNI: *sni, Pin: *pin, Path: *path, Static: priv, ServerPub: spub,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -53,5 +60,24 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("подключён к %s по HTTPS, канал зашифрован, туннель %s", *server, *addr)
-	log.Fatal(frame.Pipe(dev, sess))
+
+	undo := func() {}
+	if *routeAll {
+		ip := conn.RemoteAddr().(*net.TCPAddr).IP
+		if undo, err = route.RouteAll(dev.Name, ip); err != nil {
+			log.Fatal(err)
+		}
+		log.Print("весь трафик идёт через туннель (Ctrl+C — отключиться)")
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		undo()
+		log.Print("отключено")
+		os.Exit(0)
+	}()
+	err = frame.Pipe(dev, sess)
+	undo()
+	log.Fatal(err)
 }
