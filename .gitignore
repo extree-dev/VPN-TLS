@@ -6,3 +6,7 @@
 # данные сервера (ключи, сертификат, список клиентов) и настройки
 /data
 .env
+
+# iOS: генерируется в CI
+ios/Mobile.xcframework
+ios/VPNTLS.xcodeproj
