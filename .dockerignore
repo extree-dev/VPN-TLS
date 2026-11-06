@@ -1,0 +1,6 @@
+.git
+data
+*.key
+*.crt
+/server
+/client

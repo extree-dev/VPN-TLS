@@ -1,21 +1,30 @@
-// Сервер этапа 1.3: туннель внутри HTTPS на 443. Посторонние видят обычный сайт.
+// Сервер VPN: туннель внутри HTTPS. Посторонние видят обычный сайт.
+//
+// Два режима:
+//   - напрямую: сам слушает TLS на -listen (по умолчанию :443);
+//   - за обратным прокси (Caddy): -plain :8080, TLS и сайт обслуживает прокси.
 package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/frame"
 	"github.com/extree-dev/vpn-tls/internal/keys"
 	"github.com/extree-dev/vpn-tls/internal/noise"
+	"github.com/extree-dev/vpn-tls/internal/route"
 	"github.com/extree-dev/vpn-tls/internal/transport"
 	"github.com/extree-dev/vpn-tls/internal/tun"
 )
@@ -30,6 +39,10 @@ func main() {
 	certKey := flag.String("cert-key", "tls.key", "приватный ключ TLS-сертификата")
 	domain := flag.String("domain", "localhost", "домен для самоподписанного сертификата")
 	fallback := flag.String("fallback", "", "URL сайта, который видят посторонние (по умолчанию — встроенная заглушка)")
+	plain := flag.String("plain", "", "слушать обычный HTTP на этом адресе (режим за обратным прокси), например :8080")
+	path := flag.String("path", "", "секретный путь туннеля, например /api/stream (пусто — любой путь)")
+	allowFile := flag.String("allow-file", "", "файл с публичными ключами клиентов, по одному в строке")
+	nat := flag.Bool("nat", false, "выпускать клиентов в интернет (MASQUERADE через интерфейс по умолчанию)")
 	flag.Parse()
 
 	priv, created, err := keys.LoadOrCreate(*keyFile)
@@ -50,19 +63,9 @@ func main() {
 	}
 	log.Printf("отпечаток сертификата (для -pin клиента): %s", fp)
 
-	allowed := map[string]bool{}
-	for _, s := range strings.Split(*allow, ",") {
-		if s = strings.TrimSpace(s); s == "" {
-			continue
-		}
-		pub, err := keys.ParsePublic(s)
-		if err != nil {
-			log.Fatal(err)
-		}
-		allowed[string(pub.Bytes())] = true
-	}
-	if len(allowed) == 0 {
-		log.Fatal("не задан ни один клиент: укажите -allow <публичный ключ клиента>")
+	allowed := &allowList{flag: *allow, file: *allowFile}
+	if n := allowed.count(); n == 0 {
+		log.Printf("ВНИМАНИЕ: не задан ни один клиент — добавьте ключ в -allow или в %s", orDash(*allowFile))
 	}
 
 	var site http.Handler = transport.StubSite
@@ -87,11 +90,32 @@ func main() {
 	}
 	log.Printf("TUN %s поднят, адрес %s", dev.Name, *addr)
 
+	if *nat {
+		_, subnet, err := net.ParseCIDR(*addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		undo, err := route.EnableNAT(subnet.String())
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("NAT включён для %s: клиенты выходят в интернет через сервер", subnet)
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sig
+			undo()
+			log.Print("NAT снят, выход")
+			os.Exit(0)
+		}()
+	}
+
 	sessions := &single{}
 	h := &transport.Handler{
 		Priv:     priv,
-		Allowed:  allowed,
+		Allowed:  allowed.has,
 		Fallback: site,
+		Path:     *path,
 		OnSession: func(sess *noise.Session, conn net.Conn, client string) {
 			sessions.run(conn, func() error {
 				log.Printf("клиент подключён: %s (%s…)", conn.RemoteAddr(), client[:8])
@@ -99,6 +123,17 @@ func main() {
 			})
 		},
 	}
+	if *plain != "" {
+		srv := &http.Server{
+			Addr:              *plain,
+			Handler:           h,
+			ReadHeaderTimeout: 10 * time.Second,
+			ErrorLog:          transport.QuietLog,
+		}
+		log.Printf("слушаю %s (HTTP за обратным прокси), путь %q, разрешено клиентов: %d", *plain, *path, allowed.count())
+		log.Fatal(srv.ListenAndServe())
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           h,
@@ -113,7 +148,7 @@ func main() {
 		// HTTP/2 выключен: туннелю нужен «сырой» поток после ответа.
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
-	log.Printf("слушаю %s (HTTPS), разрешено клиентов: %d", *listen, len(allowed))
+	log.Printf("слушаю %s (HTTPS), разрешено клиентов: %d", *listen, allowed.count())
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
@@ -144,4 +179,82 @@ func (s *single) run(conn net.Conn, pipe func() error) {
 	}
 	s.mu.Unlock()
 	close(done)
+}
+
+// allowList — разрешённые ключи из флага и файла. Файл перечитывается при
+// изменении, поэтому клиентов можно добавлять без перезапуска сервера.
+type allowList struct {
+	flag, file string
+
+	mu    sync.Mutex
+	mtime time.Time
+	keys  map[string]bool
+}
+
+func (a *allowList) has(pub []byte) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reload()
+	return a.keys[string(pub)]
+}
+
+func (a *allowList) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reload()
+	return len(a.keys)
+}
+
+func (a *allowList) reload() {
+	var mtime time.Time
+	var data []byte
+	if a.file != "" {
+		if st, err := os.Stat(a.file); err == nil {
+			mtime = st.ModTime()
+		}
+	}
+	if a.keys != nil && mtime.Equal(a.mtime) {
+		return
+	}
+	if a.file != "" {
+		var err error
+		if data, err = os.ReadFile(a.file); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("%s: %v", a.file, err)
+		}
+	}
+	keys := map[string]bool{}
+	lines := append(strings.Split(a.flag, ","), strings.Split(string(data), "\n")...)
+	for _, line := range lines {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i] // комментарий
+		}
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		pub, err := keys2pub(line)
+		if err != nil {
+			log.Printf("пропускаю неверный ключ клиента %q: %v", line, err)
+			continue
+		}
+		keys[string(pub)] = true
+	}
+	if a.keys != nil {
+		log.Printf("список клиентов обновлён: %d", len(keys))
+	}
+	a.keys, a.mtime = keys, mtime
+}
+
+func keys2pub(s string) ([]byte, error) {
+	p, err := keys.ParsePublic(s)
+	if err != nil {
+		return nil, err
+	}
+	return p.Bytes(), nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-allow-file"
+	}
+	return s
 }

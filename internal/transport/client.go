@@ -3,6 +3,7 @@ package transport
 import (
 	"bufio"
 	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
@@ -24,7 +25,7 @@ type DialConfig struct {
 	Addr      string // host:port сервера
 	SNI       string // имя сервера в TLS (домен); по умолчанию host из Addr
 	Pin       string // SHA-256 отпечаток сертификата (для самоподписанного); пусто — обычная проверка
-	Path      string // путь запроса, по умолчанию "/"
+	Path      string // секретный путь туннеля на сервере, по умолчанию "/"
 	Static    *ecdh.PrivateKey
 	ServerPub *ecdh.PublicKey
 }
@@ -79,13 +80,21 @@ func Dial(cfg DialConfig) (*noise.Session, net.Conn, error) {
 		return nil, nil, err
 	}
 	cookie := base64.RawURLEncoding.EncodeToString(withPadding(msg1))
+	var wsKey [16]byte
+	rand.Read(wsKey[:])
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + sni + "\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Pragma: no-cache\r\n" +
+		"Cache-Control: no-cache\r\n" +
 		"User-Agent: " + userAgent + "\r\n" +
-		"Accept: */*\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Origin: https://" + sni + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Accept-Encoding: gzip, deflate, br, zstd\r\n" +
 		"Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7\r\n" +
 		"Cookie: " + CookieName + "=" + cookie + "\r\n" +
-		"Connection: keep-alive\r\n\r\n"
+		"Sec-WebSocket-Key: " + base64.StdEncoding.EncodeToString(wsKey[:]) + "\r\n\r\n"
 	if _, err := io.WriteString(conn, req); err != nil {
 		conn.Close()
 		return nil, nil, err
@@ -97,7 +106,7 @@ func Dial(cfg DialConfig) (*noise.Session, net.Conn, error) {
 		conn.Close()
 		return nil, nil, err
 	}
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/octet-stream" {
+	if resp.StatusCode != http.StatusSwitchingProtocols || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
 		conn.Close()
 		return nil, nil, errors.New("сервер отклонил подключение (неверный ключ сервера или ключ клиента не добавлен в -allow)")
 	}

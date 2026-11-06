@@ -1,20 +1,26 @@
 // Package transport прячет туннель внутри обычного HTTPS.
 //
-// Снаружи это TLS-соединение на 443 и HTTP/1.1-запрос с cookie. Внутри cookie —
-// первое сообщение Noise. Если оно верное и ключ клиента разрешён, сервер
-// отвечает 200 и дальше по тому же соединению идут шифрованные кадры.
-// Во всех остальных случаях запрос получает обычный сайт (fallback), поэтому
-// сканер или ТСПУ, прощупывающие сервер, видят просто веб-сервер.
+// Снаружи это TLS-соединение и запрос на установку WebSocket (HTTP Upgrade)
+// с cookie. Внутри cookie — первое сообщение Noise. Если оно верное и ключ
+// клиента разрешён, сервер отвечает 101 Switching Protocols, и дальше по
+// тому же соединению идут шифрованные кадры. Во всех остальных случаях
+// запрос получает обычный сайт (fallback), поэтому сканер или ТСПУ,
+// прощупывающие сервер, видят просто веб-сервер.
+//
+// Upgrade проходит через обычные обратные прокси (Caddy, nginx), поэтому
+// сервер можно поставить за прокси с настоящим доменом и сертификатом.
 package transport
 
 import (
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/base64"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +35,9 @@ const CookieName = "sid"
 // Handler — http.Handler, который распознаёт клиентов туннеля.
 type Handler struct {
 	Priv     *ecdh.PrivateKey
-	Allowed  map[string]bool // ключ: байты публичного ключа клиента
-	Fallback http.Handler    // что показывать всем остальным
+	Allowed  func(pub []byte) bool // разрешён ли публичный ключ клиента
+	Fallback http.Handler          // что показывать всем остальным
+	Path     string                // секретный путь туннеля; пусто — любой путь
 	// OnSession вызывается для каждого авторизованного клиента и должна
 	// блокироваться, пока сессия жива.
 	OnSession func(sess *noise.Session, conn net.Conn, client string)
@@ -40,6 +47,10 @@ type Handler struct {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if (h.Path != "" && r.URL.Path != h.Path) || !isUpgrade(r) {
+		h.Fallback.ServeHTTP(w, r)
+		return
+	}
 	req, ok := h.authenticate(r)
 	if !ok {
 		h.Fallback.ServeHTTP(w, r)
@@ -62,10 +73,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	conn.SetDeadline(time.Time{})
 
-	io.WriteString(brw, "HTTP/1.1 200 OK\r\n"+
-		"Content-Type: application/octet-stream\r\n"+
-		"Cache-Control: no-store\r\n"+
-		"Date: "+time.Now().UTC().Format(http.TimeFormat)+"\r\n\r\n")
+	io.WriteString(brw, "HTTP/1.1 101 Switching Protocols\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Accept: "+wsAccept(r.Header.Get("Sec-WebSocket-Key"))+"\r\n\r\n")
 	if err := frame.Write(brw, withPadding(resp)); err != nil {
 		return
 	}
@@ -83,6 +94,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.OnSession(sess, conn, keys.EncodePublic(req.ClientPub))
 }
 
+func isUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+// wsAccept — значение Sec-WebSocket-Accept по RFC 6455.
+func wsAccept(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
 func (h *Handler) authenticate(r *http.Request) (*noise.Request, bool) {
 	c, err := r.Cookie(CookieName)
 	if err != nil {
@@ -97,7 +119,7 @@ func (h *Handler) authenticate(r *http.Request) (*noise.Request, bool) {
 		return nil, false
 	}
 	id := string(req.ClientPub.Bytes())
-	if !h.Allowed[id] {
+	if !h.Allowed(req.ClientPub.Bytes()) {
 		return nil, false
 	}
 	h.mu.Lock()
@@ -125,7 +147,7 @@ func withPadding(msg []byte) []byte {
 // StubSite — простая страница-заглушка, если -fallback не задан.
 var StubSite = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+		w.WriteHeader(http.StatusNotFound) // пустой 404, как у Caddy file_server
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

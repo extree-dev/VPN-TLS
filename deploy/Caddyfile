@@ -1,0 +1,22 @@
+# Caddy снаружи: настоящий веб-сервер на 443, туннель — только на секретном пути.
+{
+	admin off
+	auto_https disable_redirects
+	default_sni {$DOMAIN}
+	servers {
+		# Туннелю нужен HTTP/1.1 Upgrade, поэтому HTTP/2 и HTTP/3 выключены.
+		protocols h1
+	}
+}
+
+:443 {
+	# Сертификат создаёт VPN-сервер при первом запуске (самоподписанный, для -pin).
+	# С настоящим доменом и свободными портами 80/443 можно заменить эту строку
+	# на «tls you@example.com» — Caddy сам получит сертификат Let's Encrypt.
+	tls /vpn-data/tls.crt /vpn-data/tls.key
+
+	reverse_proxy {$VPN_PATH} vpn:8080
+
+	root * /srv
+	file_server
+}

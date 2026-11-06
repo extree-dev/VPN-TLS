@@ -1,0 +1,45 @@
+# VPN-TLS: свой Caddy (TLS, сайт-заглушка) + VPN-сервер за ним.
+# Настройки — в файле .env (пример: .env.example).
+services:
+  vpn:
+    build: .
+    image: vpn-tls-server
+    container_name: vpn-tls
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - ./data:/data
+    command:
+      - -plain=:8080
+      - -path=${VPN_PATH:-/api/stream}
+      - -allow-file=/data/clients.txt
+      - -domain=${DOMAIN:-localhost}
+      - -nat
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/tls.crt"]
+      interval: 2s
+      retries: 15
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vpn-tls-caddy
+    restart: unless-stopped
+    depends_on:
+      vpn:
+        condition: service_healthy
+    ports:
+      - "${PORT:-443}:443/tcp"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      VPN_PATH: ${VPN_PATH:-/api/stream}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/site:/srv:ro
+      - ./data:/vpn-data:ro
+      - caddy_data:/data
+
+volumes:
+  caddy_data:
