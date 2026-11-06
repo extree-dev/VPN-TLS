@@ -6,6 +6,7 @@ package route
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -72,10 +73,58 @@ func RouteAll(dev string, server net.IP) (func(), error) {
 			return nil, err
 		}
 	}
+	// Туннель только IPv4: чтобы IPv6-трафик не ушёл мимо VPN, закрываем его
+	// маршрутами unreachable — приложения сразу переключатся на IPv4.
+	// Если IPv6 в системе выключен, команды просто не сработают — это нормально.
+	v6 := 0
+	for _, half := range []string{"::/1", "8000::/1"} {
+		if run("ip", "-6", "route", "replace", "unreachable", half) == nil {
+			v6++
+		}
+	}
 	return func() {
 		run("ip", "route", "del", "0.0.0.0/1", "dev", dev)
 		run("ip", "route", "del", "128.0.0.0/1", "dev", dev)
 		run("ip", "route", "del", server.String()+"/32")
+		if v6 > 0 {
+			run("ip", "-6", "route", "del", "unreachable", "::/1")
+			run("ip", "-6", "route", "del", "unreachable", "8000::/1")
+		}
+	}, nil
+}
+
+const resolvConf = "/etc/resolv.conf"
+
+// SetDNS записывает DNS-серверы туннеля в /etc/resolv.conf и возвращает
+// функцию, которая вернёт прежний файл (или символическую ссылку).
+func SetDNS(servers []string) (func(), error) {
+	if len(servers) == 0 {
+		return func() {}, nil
+	}
+	link, linkErr := os.Readlink(resolvConf)
+	old, err := os.ReadFile(resolvConf)
+	if err != nil && linkErr != nil {
+		return nil, err
+	}
+	var b strings.Builder
+	b.WriteString("# записано vpn-tls, будет восстановлено при отключении\n")
+	for _, s := range servers {
+		b.WriteString("nameserver " + s + "\n")
+	}
+	tmp := resolvConf + ".vpntls"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, resolvConf); err != nil {
+		return nil, err
+	}
+	return func() {
+		if linkErr == nil {
+			os.Remove(resolvConf)
+			os.Symlink(link, resolvConf)
+			return
+		}
+		os.WriteFile(resolvConf, old, 0o644)
 	}, nil
 }
 

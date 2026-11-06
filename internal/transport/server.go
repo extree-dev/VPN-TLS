@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/extree-dev/vpn-tls/internal/frame"
-	"github.com/extree-dev/vpn-tls/internal/keys"
 	"github.com/extree-dev/vpn-tls/internal/noise"
 )
 
@@ -38,9 +37,12 @@ type Handler struct {
 	Allowed  func(pub []byte) bool // разрешён ли публичный ключ клиента
 	Fallback http.Handler          // что показывать всем остальным
 	Path     string                // секретный путь туннеля; пусто — любой путь
+	// Payload возвращает настройки для клиента (адрес, DNS…), которые уйдут
+	// во втором сообщении рукопожатия. Ошибка — отказ в подключении.
+	Payload func(client *ecdh.PublicKey) ([]byte, error)
 	// OnSession вызывается для каждого авторизованного клиента и должна
 	// блокироваться, пока сессия жива.
-	OnSession func(sess *noise.Session, conn net.Conn, client string)
+	OnSession func(sess *noise.Session, conn net.Conn, client *ecdh.PublicKey)
 
 	mu     sync.Mutex
 	lastTS map[string]uint64
@@ -56,7 +58,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Fallback.ServeHTTP(w, r)
 		return
 	}
-	resp, k, err := req.Accept()
+	payload, err := h.Payload(req.ClientPub)
+	if err != nil {
+		h.Fallback.ServeHTTP(w, r)
+		return
+	}
+	resp, k, err := req.Accept(payload)
 	if err != nil {
 		h.Fallback.ServeHTTP(w, r)
 		return
@@ -77,7 +84,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
 		"Sec-WebSocket-Accept: "+wsAccept(r.Header.Get("Sec-WebSocket-Key"))+"\r\n\r\n")
-	if err := frame.Write(brw, withPadding(resp)); err != nil {
+	if err := frame.Write(brw, withPadding(lengthPrefixed(resp))); err != nil {
 		return
 	}
 	if err := brw.Flush(); err != nil {
@@ -91,7 +98,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	h.OnSession(sess, conn, keys.EncodePublic(req.ClientPub))
+	h.OnSession(sess, conn, req.ClientPub)
 }
 
 func isUpgrade(r *http.Request) bool {
@@ -132,6 +139,14 @@ func (h *Handler) authenticate(r *http.Request) (*noise.Request, bool) {
 	}
 	h.lastTS[id] = req.Timestamp
 	return req, true
+}
+
+// lengthPrefixed добавляет 2 байта длины, чтобы получатель отделил сообщение от padding.
+func lengthPrefixed(msg []byte) []byte {
+	out := make([]byte, 2+len(msg))
+	out[0], out[1] = byte(len(msg)>>8), byte(len(msg))
+	copy(out[2:], msg)
+	return out
 }
 
 // withPadding дописывает к сообщению 16–112 случайных байт, чтобы размер

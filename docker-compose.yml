@@ -12,12 +12,15 @@ services:
       - net.ipv4.ip_forward=1
     volumes:
       - ./data:/data
-    command:
-      - -plain=:8080
-      - -path=${VPN_PATH:-/api/stream}
-      - -allow-file=/data/clients.txt
-      - -domain=${DOMAIN:-localhost}
-      - -nat
+    environment:
+      VPN_PLAIN: ":8080"
+      VPN_PATH: ${VPN_PATH:-/api/stream}
+      VPN_DOMAIN: ${DOMAIN:-localhost}
+      VPN_PUBLIC: ${PUBLIC_ADDR:-}
+      VPN_PUBLIC_PORT: ${PORT:-443}
+      VPN_CLIENTS: /data/clients.txt
+      VPN_DNS: ${DNS:-1.1.1.1,1.0.0.1}
+      VPN_NAT: "1"
     healthcheck:
       test: ["CMD", "test", "-f", "/data/tls.crt"]
       interval: 2s

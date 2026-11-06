@@ -31,8 +31,9 @@ const (
 
 	// Msg1Size — размер первого сообщения: e(32) + s(32+16) + payload(8+16).
 	Msg1Size = keySize + keySize + tagSize + 8 + tagSize
-	// Msg2Size — размер второго сообщения: e(32) + пустой payload(16).
-	Msg2Size = keySize + tagSize
+	// Msg2MinSize — минимальный размер второго сообщения: e(32) + тег payload(16).
+	// Дальше идёт зашифрованный payload сервера (настройки клиента).
+	Msg2MinSize = keySize + tagSize
 )
 
 var (
@@ -186,30 +187,32 @@ func NewInitiator(static *ecdh.PrivateKey, serverPub *ecdh.PublicKey, timestamp 
 	return &Initiator{sym: sym, s: static, e: e}, msg, nil
 }
 
-// Finish обрабатывает ответ сервера и возвращает ключи транспорта.
-func (in *Initiator) Finish(msg2 []byte) (*Keys, error) {
-	if len(msg2) != Msg2Size {
-		return nil, ErrHandshake
+// Finish обрабатывает ответ сервера и возвращает ключи транспорта и payload
+// сервера (настройки, зашифрованные и аутентифицированные рукопожатием).
+func (in *Initiator) Finish(msg2 []byte) (*Keys, []byte, error) {
+	if len(msg2) < Msg2MinSize {
+		return nil, nil, ErrHandshake
 	}
 	re, err := ParsePublic(msg2[:keySize])
 	if err != nil {
-		return nil, ErrHandshake
+		return nil, nil, ErrHandshake
 	}
 	in.sym.mixHash(msg2[:keySize])
 	for _, priv := range []*ecdh.PrivateKey{in.e, in.s} { // ee, se
 		k, err := dh(priv, re)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := in.sym.mixKey(k); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	if _, err := in.sym.decryptAndHash(msg2[keySize:]); err != nil {
-		return nil, err
+	payload, err := in.sym.decryptAndHash(msg2[keySize:])
+	if err != nil {
+		return nil, nil, err
 	}
 	k1, k2 := in.sym.split()
-	return &Keys{Send: k1, Recv: k2}, nil
+	return &Keys{Send: k1, Recv: k2}, payload, nil
 }
 
 // ---------- responder (сервер) ----------
@@ -265,9 +268,9 @@ func ReadRequest(static *ecdh.PrivateKey, msg []byte) (*Request, error) {
 	return &Request{ClientPub: rs, Timestamp: binary.BigEndian.Uint64(ts), sym: sym, re: re}, nil
 }
 
-// Accept формирует ответ клиенту и возвращает ключи транспорта.
-// Вызывать только после проверки ClientPub и Timestamp.
-func (r *Request) Accept() ([]byte, *Keys, error) {
+// Accept формирует ответ клиенту с payload (настройками) и возвращает ключи
+// транспорта. Вызывать только после проверки ClientPub и Timestamp.
+func (r *Request) Accept(payload []byte) ([]byte, *Keys, error) {
 	e, err := GenerateKey()
 	if err != nil {
 		return nil, nil, err
@@ -283,7 +286,7 @@ func (r *Request) Accept() ([]byte, *Keys, error) {
 			return nil, nil, err
 		}
 	}
-	msg = append(msg, r.sym.encryptAndHash(nil)...)
+	msg = append(msg, r.sym.encryptAndHash(payload)...)
 	k1, k2 := r.sym.split()
 	return msg, &Keys{Send: k2, Recv: k1}, nil
 }
@@ -328,6 +331,10 @@ func NewSession(k *Keys, rw io.ReadWriter,
 		rbuf: make([]byte, 65535), pbuf: make([]byte, 65535), wbuf: make([]byte, 0, 65535)}, nil
 }
 
+// WriteKeepalive отправляет пустой кадр: держит NAT и показывает, что канал жив.
+// Получатель увидит пакет нулевой длины и должен его пропустить.
+func (s *Session) WriteKeepalive() error { return s.WritePacket(nil) }
+
 // WritePacket шифрует и отправляет один пакет.
 func (s *Session) WritePacket(p []byte) error {
 	if s.wn == math.MaxUint64 {
@@ -350,6 +357,7 @@ func (s *Session) WritePacket(p []byte) error {
 }
 
 // ReadPacket читает и расшифровывает один пакет в buf.
+// Пакет нулевой длины — keepalive.
 func (s *Session) ReadPacket(buf []byte) ([]byte, error) {
 	ct, err := s.read(s.rw, s.rbuf)
 	if err != nil {
